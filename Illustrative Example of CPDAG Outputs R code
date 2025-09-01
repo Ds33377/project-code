@@ -1,1 +1,260 @@
+# --- Dependencies ---
+suppressPackageStartupMessages({
+  library(graph); library(RBGL)
+  library(pcalg); library(bnlearn); library(igraph)
+  library(ggplot2)
+})
 
+# --- Adjacency helpers ---
+adj_from_graphNEL <- function(gNEL){ A <- as(gNEL,"matrix"); mode(A) <- "numeric"; diag(A) <- 0; A }
+adj_from_pc  <- function(pcFit) adj_from_graphNEL(pcFit@graph)
+adj_from_ges <- function(gesFit){
+  if (is.list(gesFit) && !is.null(gesFit$essgraph)) return(adj_from_graphNEL(gesFit$essgraph))
+  if ("essgraph" %in% slotNames(gesFit))         return(adj_from_graphNEL(methods::slot(gesFit,"essgraph")))
+  if (inherits(gesFit,"graphNEL"))                return(adj_from_graphNEL(gesFit))
+  if (is.list(gesFit) && !is.null(gesFit$graph))  return(adj_from_graphNEL(gesFit$graph))
+  stop("Cannot extract graph from GES result")
+}
+adj_from_bn_cpdag <- function(bnObj){
+  cp <- bnlearn::cpdag(bnObj); A <- bnlearn::amat(cp); mode(A) <- "numeric"; diag(A) <- 0; A
+}
+
+# --- Graph utilities ---
+dens_to_prob <- function(p, dens = c("sparse","dense")){
+  dens <- match.arg(dens); prob <- if (dens=="sparse") 2/p else 6/p; min(0.5, prob)
+}
+W_to_graphNEL <- function(W, labels = NULL){
+  stopifnot(is.matrix(W), nrow(W)==ncol(W))
+  p <- nrow(W); if (is.null(labels)) labels <- paste0("X", seq_len(p))
+  edgeL <- vector("list", p); names(edgeL) <- labels
+  for (i in seq_len(p)) {
+    tgt <- which(W[i, ] != 0)
+    edgeL[[i]] <- if (length(tgt)) list(edges = labels[tgt], weights = as.numeric(W[i, tgt])) else list()
+  }
+  graph::graphNEL(nodes = labels, edgeL = edgeL, edgemode = "directed")
+}
+gen_dag_star_simple <- function(p, dens){
+  prob <- dens_to_prob(p, dens)
+  m_target <- max(1, round(prob * p * (p - 1) / 2))
+  W <- matrix(0, p, p)
+  if (p >= 2) {
+    k_hub <- min(p - 1, max(1, round(prob * (p - 1))))
+    hub_targets <- sample(2:p, k_hub)
+    W[1, hub_targets] <- runif(k_hub, .3, 1) * sample(c(-1, 1), k_hub, TRUE)
+  }
+  need <- max(0, m_target - sum(W != 0))
+  if (need > 0) {
+    all_pairs <- which(upper.tri(matrix(TRUE, p, p)), arr.ind = TRUE)
+    keep <- !(all_pairs[,1] == 1 & W[1, all_pairs[,2]] != 0)
+    cand <- all_pairs[keep, , drop = FALSE]
+    if (nrow(cand) > 0) {
+      take <- cand[sample(nrow(cand), size = min(need, nrow(cand))), , drop = FALSE]
+      for (r in seq_len(nrow(take))) {
+        i <- take[r, 1]; j <- take[r, 2]
+        if (W[i, j] == 0) W[i, j] <- runif(1, .3, 1) * sample(c(-1, 1), 1)
+      }
+    }
+  }
+  W_to_graphNEL(W, labels = paste0("X", seq_len(p)))
+}
+gen_true_dag_mixed <- function(p, dens, star_ratio = 0.2){
+  if (runif(1) < star_ratio) gen_dag_star_simple(p, dens) else
+    randomDAG(p, prob = dens_to_prob(p, dens), lB = 0.3, uB = 1.0)
+}
+
+# --- Gaussian SEM ---
+sem_gaussian_from_dag <- function(dag, n, noise_sd = 1){
+  B <- pcalg::wgtMatrix(dag); B[is.na(B)] <- 0; B <- as.matrix(B)
+  p <- ncol(B)
+  G <- igraph::graph_from_adjacency_matrix(B != 0, mode = "directed")
+  ord <- as.integer(igraph::topo_sort(G, mode = "out"))
+  X <- matrix(0, n, p)
+  for (k in ord) {
+    parents <- which(B[,k] != 0)
+    X[,k] <- rnorm(n, 0, noise_sd)
+    if (length(parents) > 0) X[,k] <- X[,k] + X[,parents,drop=FALSE] %*% B[parents,k,drop=FALSE]
+  }
+  colnames(X) <- colnames(B); X
+}
+
+# --- Metrics ---
+metrics_from_adjs <- function(estA, trueCPA){
+  if (is.null(estA)) return(data.frame(skel_f1=NA_real_, shd_cpdag=NA_real_))
+  S_est <- 1 * ((estA + t(estA)) > 0); diag(S_est) <- 0
+  S_true <- 1 * ((trueCPA + t(trueCPA)) > 0); diag(S_true) <- 0
+  upper_indices <- upper.tri(S_est, diag = FALSE)
+  tp <- sum(S_est[upper_indices]==1 & S_true[upper_indices]==1)
+  fp <- sum(S_est[upper_indices]==1 & S_true[upper_indices]==0)
+  fn <- sum(S_est[upper_indices]==0 & S_true[upper_indices]==1)
+  prec <- ifelse(tp+fp==0, NA, tp/(tp+fp))
+  rec  <- ifelse(tp+fn==0, NA, tp/(tp+fn))
+  f1 <- ifelse(is.na(prec)|is.na(rec)|(prec+rec)==0, NA, 2*prec*rec/(prec+rec))
+  shd_cpdag <- sum(estA != trueCPA)/2
+  data.frame(skel_f1=f1, shd_cpdag=shd_cpdag)
+}
+
+# --- Parameters ---
+n_viz <- 10000
+p_viz <- 10
+dist_viz <- "gaussian"
+dens_viz <- "sparse"
+alpha_viz <- 0.05
+seed_viz <- 20250816
+set.seed(seed_viz)
+labels <- paste0("X", seq_len(p_viz))
+
+# --- True graph & data ---
+dag_true <- gen_true_dag_mixed(p_viz, dens_viz, star_ratio = 0.2)
+cpdag_true <- adj_from_graphNEL(dag2cpdag(dag_true))
+X <- sem_gaussian_from_dag(dag_true, n = n_viz)
+colnames(X) <- labels
+df_data <- as.data.frame(X)
+suff <- list(C = cor(df_data), n = nrow(df_data))
+
+# --- Algorithms ---
+results <- list()
+results[["Ground_Truth"]] <- cpdag_true
+algorithms <- list(
+  PC = function(){
+    fit <- pc(suffStat=suff, indepTest=gaussCItest, alpha=alpha_viz, labels=labels,
+              skel.method="original", conservative=FALSE, maj.rule=FALSE)
+    adj_from_pc(fit)
+  },
+  CPC = function(){
+    fit <- pc(suffStat=suff, indepTest=gaussCItest, alpha=alpha_viz, labels=labels,
+              skel.method="original", conservative=TRUE, maj.rule=FALSE)
+    adj_from_pc(fit)
+  },
+  PC_stable = function(){
+    fit <- pc(suffStat=suff, indepTest=gaussCItest, alpha=alpha_viz, labels=labels,
+              skel.method="stable", conservative=FALSE, maj.rule=FALSE)
+    adj_from_pc(fit)
+  },
+  GES = function(){
+    X_matrix <- as.matrix(df_data)
+    colnames(X_matrix) <- paste0("X", seq_len(ncol(X_matrix)))
+    sc <- methods::new("GaussL0penObsScore", dat = X_matrix)
+    fit <- pcalg::ges(sc)
+    adj_from_ges(fit)
+  },
+  HC = function(){ adj_from_bn_cpdag(hc(df_data, score = "bic-g")) },
+  Tabu = function(){ adj_from_bn_cpdag(tabu(df_data, score = "bic-g", tabu = 50)) }
+)
+for (alg_name in names(algorithms)) results[[alg_name]] <- tryCatch(algorithms[[alg_name]](), error=function(e) NULL)
+
+# --- Layout ---
+create_circular_layout <- function(n_nodes, radius = 2){
+  angles <- seq(0, 2*pi, length.out = n_nodes + 1)[1:n_nodes]
+  x <- radius * cos(angles); y <- radius * sin(angles)
+  layout <- matrix(c(x, y), ncol = 2)
+  rownames(layout) <- labels; colnames(layout) <- c("x","y"); layout
+}
+fixed_layout <- create_circular_layout(p_viz)
+
+# --- Edge trimming ---
+trim_segments_smart <- function(df, pad_node = 0.11, frac = 0.06, extra_end = 0){
+  if (is.null(df) || nrow(df) == 0) return(df)
+  vx <- df$xend - df$x; vy <- df$yend - df$y
+  L  <- sqrt(pmax(vx^2 + vy^2, 1e-12))
+  ux <- vx / L;  uy <- vy / L
+  pad_s <- pmin(L * frac, pad_node)
+  pad_e <- pmin(L * frac, pad_node) + extra_end
+  df$x    <- df$x    + ux * pad_s
+  df$y    <- df$y    + uy * pad_s
+  df$xend <- df$xend - ux * pad_e
+  df$yend <- df$yend - uy * pad_e
+  df
+}
+viz_params <- list(
+  pad_node = 0.18,
+  frac = 0.09,
+  extra_end = 0.04,
+  arrow_len = grid::unit(0.19, "inches"),
+  arrow_ang = 22,
+  edge_size = 1.8
+)
+
+# --- Plot function ---
+create_single_cpdag_plot <- function(adj_matrix, title){
+  if (is.null(adj_matrix)) {
+    return(ggplot() +
+             geom_text(aes(x=0,y=0), label="Algorithm Failed", size=8, color="red") +
+             ggtitle(title) + theme_void() +
+             theme(plot.title = element_text(hjust=0.5, size=18, face="bold")) +
+             xlim(-1,1) + ylim(-1,1))
+  }
+  subtitle <- if (title != "Ground Truth") {
+    metrics <- metrics_from_adjs(adj_matrix, cpdag_true)
+    paste(ifelse(is.na(metrics$skel_f1), "F1: NA", sprintf("F1: %.3f", metrics$skel_f1)),
+          ifelse(is.na(metrics$shd_cpdag), "SHD: NA", sprintf("SHD: %.0f", metrics$shd_cpdag)),
+          sep=" | ")
+  } else "Reference Standard"
+  nodes_df <- data.frame(name=labels, x=fixed_layout[,1], y=fixed_layout[,2])
+  edges_list <- list()
+  for (i in 1:p_viz) for (j in 1:p_viz) if (i!=j && adj_matrix[i,j]!=0) {
+    if (adj_matrix[j,i]!=0) {
+      if (i<j) edges_list[[length(edges_list)+1]] <- data.frame(
+        from=i,to=j,type="undirected",
+        x=fixed_layout[i,1],y=fixed_layout[i,2],
+        xend=fixed_layout[j,1],yend=fixed_layout[j,2])
+    } else {
+      edges_list[[length(edges_list)+1]] <- data.frame(
+        from=i,to=j,type="directed",
+        x=fixed_layout[i,1],y=fixed_layout[i,2],
+        xend=fixed_layout[j,1],yend=fixed_layout[j,2])
+    }
+  }
+  edges_df <- if (length(edges_list)>0) do.call(rbind, edges_list) else data.frame()
+  p <- ggplot() + theme_void() + coord_fixed() + ggtitle(title) + labs(subtitle=subtitle) +
+    theme(plot.title = element_text(hjust=0.5, size=18, face="bold"),
+          plot.subtitle = element_text(hjust=0.5, size=14, color="gray50"),
+          plot.margin = margin(20,20,20,20))
+  if (nrow(edges_df) > 0) {
+    dir_edges <- edges_df[edges_df$type=="directed", ]
+    if (nrow(dir_edges) > 0) {
+      dir_edges <- trim_segments_smart(dir_edges,
+                                       pad_node = viz_params$pad_node,
+                                       frac     = viz_params$frac,
+                                       extra_end= viz_params$extra_end)
+      p <- p + geom_segment(
+        data=dir_edges, aes(x=x,y=y,xend=xend,yend=yend),
+        color="black", size=viz_params$edge_size, lineend="round",
+        arrow=arrow(length=viz_params$arrow_len, type="closed", angle=viz_params$arrow_ang))
+    }
+    undir_edges <- edges_df[edges_df$type=="undirected", ]
+    if (nrow(undir_edges) > 0) {
+      undir_edges <- trim_segments_smart(undir_edges,
+                                         pad_node = viz_params$pad_node,
+                                         frac     = viz_params$frac,
+                                         extra_end= 0)
+      p <- p + geom_segment(
+        data=undir_edges, aes(x=x,y=y,xend=xend,yend=yend),
+        color="blue", size=viz_params$edge_size+0.4, alpha=0.75, lineend="round")
+    }
+  }
+  p + geom_point(data=nodes_df, aes(x=x,y=y), size=22, color="#FF8C00", fill="white", shape=21, stroke=3.5) +
+    geom_text(data=nodes_df, aes(x=x,y=y,label=name), size=7.8, fontface="bold", color="black")
+}
+
+# --- Output dir ---
+output_dir <- "individual_cpdags"
+if (!dir.exists(output_dir)) dir.create(output_dir)
+
+# --- Save plots ---
+plot_names <- c("Ground_Truth", names(algorithms))
+display_names <- c("Ground Truth", "PC", "CPC", "PC-stable", "GES", "HC", "Tabu")
+for (i in seq_along(plot_names)) {
+  alg_name <- plot_names[i]; display_name <- display_names[i]
+  p <- create_single_cpdag_plot(results[[alg_name]], display_name)
+  filename <- sprintf("%02d_%s.png", i, gsub("[^A-Za-z0-9]", "_", alg_name))
+  filepath <- file.path(output_dir, filename)
+  ggsave(filepath, p, width = 10, height = 10, dpi = 300, bg = "white")
+}
+
+# --- Legend ---
+cat("\nAll individual plots saved to:", normalizePath(output_dir), "\n")
+cat("Legend:\n")
+cat("- Black arrows: directed edges (X → Y)\n")
+cat("- Blue thick lines: undirected edges (X — Y)\n")
+cat("- F1: skeleton F1-score vs ground truth\n")
+cat("- SHD: structural hamming distance vs ground truth\n")
