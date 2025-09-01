@@ -1,0 +1,416 @@
+# --- Script dir & output root ---
+.get_script_dir <- function() {
+  if (requireNamespace("rstudioapi", quietly = TRUE)) {
+    if (tryCatch(rstudioapi::isAvailable(), error = function(e) FALSE)) {
+      ctx <- tryCatch(rstudioapi::getActiveDocumentContext(), error = function(e) NULL)
+      if (!is.null(ctx) && nzchar(ctx$path)) return(dirname(ctx$path))
+    }
+  }
+  if (!is.null(sys.frames()[[1]]$ofile)) return(dirname(normalizePath(sys.frames()[[1]]$ofile)))
+  args <- commandArgs(trailingOnly = FALSE)
+  file_arg <- grep("^--file=", args, value = TRUE)
+  if (length(file_arg)) return(dirname(normalizePath(sub("^--file=", "", file_arg))))
+  getwd()
+}
+script_dir <- .get_script_dir()
+setwd(script_dir)
+message("Write to directory：", normalizePath(file.path(script_dir, "projects_star", "causal_bench"), winslash = "/"))
+
+# --- Dependencies ---
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+need_graph <- !requireNamespace("graph", quietly = TRUE)
+need_rbgl  <- !requireNamespace("RBGL",  quietly = TRUE)
+if (need_graph || need_rbgl) {
+  options(BioC_mirror = "https://bioconductor.org")
+  BiocManager::install(c(if (need_graph) "graph", if (need_rbgl) "RBGL"),
+                       update = FALSE, ask = FALSE)
+}
+cran_pkgs <- c("pcalg","bnlearn","igraph","ggplot2","dplyr","tidyr","readr","scales")
+for (p in cran_pkgs) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+suppressPackageStartupMessages({
+  library(graph); library(RBGL)
+  library(pcalg); library(bnlearn); library(igraph)
+  library(ggplot2); library(dplyr); library(tidyr); library(readr); library(scales)
+})
+
+# --- Directories ---
+root <- file.path(script_dir, "projects_star", "causal_bench")
+dirs <- file.path(root, c("R","data","output/raw","output/summary","figs","logs","configs"))
+invisible(lapply(dirs, dir.create, recursive = TRUE, showWarnings = FALSE))
+writeLines(enc2utf8("# STAR vs ER Benchmark (Gaussian)"),
+           file.path(root,"README.md"), useBytes = TRUE)
+
+# --- Utilities ---
+capture_time_with_timeout <- function(expr, timeout_seconds = 300) {
+  t0 <- proc.time()
+  result <- tryCatch({
+    setTimeLimit(cpu = timeout_seconds, elapsed = timeout_seconds, transient = TRUE)
+    res <- eval.parent(substitute(expr))
+    setTimeLimit()
+    res
+  }, error = function(e) {
+    setTimeLimit()
+    structure(list(`__error__` = conditionMessage(e)), class = "captured_error")
+  })
+  elapsed <- as.numeric((proc.time() - t0)[3])
+  if (inherits(result, "captured_error")) {
+    error_msg <- result$`__error__`
+    if (grepl("reached elapsed time limit|reached CPU time limit", error_msg)) {
+      error_msg <- paste0("TIMEOUT after ", timeout_seconds, " seconds")
+    }
+    list(value = NULL, elapsed = elapsed, error = error_msg)
+  } else list(value = result, elapsed = elapsed, error = NA_character_)
+}
+
+get_timeout_for_problem <- function(n, p, alg) {
+  base_timeout <- 120
+  n_factor <- log10(n/100)
+  p_factor <- (p/10)^1.5
+  alg_factor <- switch(alg,"PC"=2,"CPC"=3,"PC-stable"=4,"GES"=1.5,"HC"=3,"Tabu"=4)
+  timeout <- base_timeout * n_factor * p_factor * alg_factor
+  min_timeout <- 60
+  max_timeout <- if (alg %in% c("HC","Tabu")) 1800 else 900
+  max(min_timeout, min(max_timeout, round(timeout)))
+}
+
+adj_from_graphNEL <- function(gNEL){A<-as(gNEL,"matrix");mode(A)<-"numeric";diag(A)<-0;A}
+adj_from_pc  <- function(pcFit) adj_from_graphNEL(pcFit@graph)
+adj_from_ges <- function(gesFit){
+  if (is.list(gesFit) && !is.null(gesFit$essgraph)) return(adj_from_graphNEL(gesFit$essgraph))
+  if ("essgraph" %in% slotNames(gesFit)) return(adj_from_graphNEL(methods::slot(gesFit,"essgraph")))
+  if (inherits(gesFit,"graphNEL")) return(adj_from_graphNEL(gesFit))
+  if (is.list(gesFit) && !is.null(gesFit$graph)) return(adj_from_graphNEL(gesFit$graph))
+  stop("Cannot get graph from GES")
+}
+adj_from_bn <- function(bnObj){A<-bnlearn::amat(bnObj);mode(A)<-"numeric";diag(A)<-0;A}
+adj_from_bn_cpdag <- function(bnObj){cp<-bnlearn::cpdag(bnObj);A<-bnlearn::amat(cp);mode(A)<-"numeric";diag(A)<-0;A}
+to_skeleton <- function(A){S<-1*((A+t(A))>0);diag(S)<-0;S}
+upper <- function(M) M[upper.tri(M, diag = FALSE)]
+metrics_from_adjs <- function(estA, trueCPA){
+  if (is.null(estA)) return(data.frame(skel_precision=NA, skel_recall=NA, skel_f1=NA, shd_cpdag=NA))
+  S_est <- to_skeleton(estA); S_true <- to_skeleton(trueCPA)
+  tp<-sum(upper(S_est==1 & S_true==1)); fp<-sum(upper(S_est==1 & S_true==0)); fn<-sum(upper(S_est==0 & S_true==1))
+  prec <- ifelse(tp+fp==0, NA, tp/(tp+fp)); rec <- ifelse(tp+fn==0, NA, tp/(tp+fn))
+  f1 <- ifelse(is.na(prec)|is.na(rec)|(prec+rec)==0, NA, 2*prec*rec/(prec+rec))
+  shd_cpdag <- sum(estA != trueCPA)/2
+  data.frame(skel_precision=prec, skel_recall=rec, skel_f1=f1, shd_cpdag=shd_cpdag)
+}
+
+dens_to_prob_sparse_match_star <- function(p){ min(0.5, 2/p) } 
+
+# --- Graph generators ---
+gen_true_dag_er <- function(p){
+  randomDAG(p, prob = dens_to_prob_sparse_match_star(p), lB = 0.3, uB = 1.0)
+}
+W_to_graphNEL <- function(W, labels = NULL) {
+  stopifnot(is.matrix(W), nrow(W) == ncol(W))
+  p <- nrow(W)
+  if (is.null(labels)) labels <- paste0("X", seq_len(p))
+  edgeL <- vector("list", p); names(edgeL) <- labels
+  for (i in seq_len(p)) {
+    tgt <- which(W[i, ] != 0)
+    if (length(tgt)) edgeL[[i]] <- list(edges = labels[tgt], weights = as.numeric(W[i, tgt])) else edgeL[[i]] <- list()
+  }
+  graph::graphNEL(nodes = labels, edgeL = edgeL, edgemode = "directed")
+}
+gen_true_dag_star <- function(p){
+  W <- matrix(0, p, p)
+  if (p >= 2) W[1, 2:p] <- runif(p-1, 0.3, 1.0) * sample(c(-1,1), p-1, TRUE)
+  W_to_graphNEL(W, labels = paste0("X", seq_len(p)))
+}
+
+# --- SEM sampler ---
+sem_gaussian_from_dag <- function(dag, n, noise_sd=1){
+  B <- pcalg::wgtMatrix(dag); B[is.na(B)] <- 0; B <- as.matrix(B)
+  p <- ncol(B); G <- igraph::graph_from_adjacency_matrix(B!=0, mode="directed")
+  ord <- as.integer(igraph::topo_sort(G, mode="out"))
+  X <- matrix(0, n, p)
+  for (k in ord){
+    parents <- which(B[,k]!=0)
+    X[,k] <- rnorm(n, 0, noise_sd)
+    if (length(parents)>0) X[,k] <- X[,k] + X[,parents,drop=FALSE] %*% B[parents,k,drop=FALSE]
+  }
+  colnames(X) <- colnames(B); X
+}
+
+# --- Single run (graph_type: "ER" | "STAR") ---
+run_once <- function(graph_type=c("ER","STAR"), p=20, n=1000,
+                     alpha=0.05, seed=123,
+                     enable_timeout=TRUE, custom_timeouts=NULL){
+  graph_type <- match.arg(graph_type); set.seed(seed)
+  labels <- paste0("X", seq_len(p))
+  dag_true <- if (graph_type=="ER") gen_true_dag_er(p) else gen_true_dag_star(p)
+  A_true_cpd <- adj_from_graphNEL(dag2cpdag(dag_true))
+  
+  X <- sem_gaussian_from_dag(dag_true, n=n); colnames(X) <- labels
+  df <- as.data.frame(X)
+  suff <- list(C = cor(df), n = nrow(df))
+  
+  if (enable_timeout) {
+    pc_timeout  <- if (!is.null(custom_timeouts$PC)) custom_timeouts$PC else get_timeout_for_problem(n,p,"PC")
+    cpc_timeout <- if (!is.null(custom_timeouts$CPC)) custom_timeouts$CPC else get_timeout_for_problem(n,p,"CPC")
+    pcs_timeout <- if (!is.null(custom_timeouts$`PC-stable`)) custom_timeouts$`PC-stable` else get_timeout_for_problem(n,p,"PC-stable")
+    ges_timeout <- if (!is.null(custom_timeouts$GES)) custom_timeouts$GES else get_timeout_for_problem(n,p,"GES")
+    hc_timeout  <- if (!is.null(custom_timeouts$HC)) custom_timeouts$HC else get_timeout_for_problem(n,p,"HC")
+    tabu_timeout<- if (!is.null(custom_timeouts$Tabu)) custom_timeouts$Tabu else get_timeout_for_problem(n,p,"Tabu")
+  } else pc_timeout <- cpc_timeout <- pcs_timeout <- ges_timeout <- hc_timeout <- tabu_timeout <- Inf
+  
+  pc_res <- capture_time_with_timeout({
+    fit <- pc(suffStat=suff, indepTest=gaussCItest, alpha=alpha, labels=labels,
+              skel.method="original", conservative=FALSE, maj.rule=FALSE)
+    adj_from_pc(fit)
+  }, timeout_seconds = pc_timeout)
+  cpc_res <- capture_time_with_timeout({
+    fit <- pc(suffStat=suff, indepTest=gaussCItest, alpha=alpha, labels=labels,
+              skel.method="original", conservative=TRUE, maj.rule=FALSE)
+    adj_from_pc(fit)
+  }, timeout_seconds = cpc_timeout)
+  pcs_res <- capture_time_with_timeout({
+    fit <- pc(suffStat=suff, indepTest=gaussCItest, alpha=alpha, labels=labels,
+              skel.method="stable", conservative=FALSE, maj.rule=FALSE)
+    adj_from_pc(fit)
+  }, timeout_seconds = pcs_timeout)
+  ges_res <- capture_time_with_timeout({
+    Xm <- as.matrix(df); colnames(Xm) <- labels
+    sc <- methods::new("GaussL0penObsScore", dat=Xm)
+    fit <- pcalg::ges(sc); adj_from_ges(fit)
+  }, timeout_seconds = ges_timeout)
+  hc_res   <- capture_time_with_timeout({ adj_from_bn_cpdag(hc(df,  score="bic-g")) }, timeout_seconds = hc_timeout)
+  tabu_res <- capture_time_with_timeout({ adj_from_bn_cpdag(tabu(df, score="bic-g", tabu=50)) }, timeout_seconds = tabu_timeout)
+  
+  dplyr::bind_rows(
+    data.frame(alg="PC",        metrics_from_adjs(pc_res$value,   A_true_cpd), time=pc_res$elapsed,  err=pc_res$error),
+    data.frame(alg="CPC",       metrics_from_adjs(cpc_res$value,  A_true_cpd), time=cpc_res$elapsed, err=cpc_res$error),
+    data.frame(alg="PC-stable", metrics_from_adjs(pcs_res$value,  A_true_cpd), time=pcs_res$elapsed, err=pcs_res$error),
+    data.frame(alg="GES",       metrics_from_adjs(ges_res$value,  A_true_cpd), time=ges_res$elapsed, err=ges_res$error),
+    data.frame(alg="HC",        metrics_from_adjs(hc_res$value,   A_true_cpd), time=hc_res$elapsed,  err=hc_res$error),
+    data.frame(alg="Tabu",      metrics_from_adjs(tabu_res$value, A_true_cpd), time=tabu_res$elapsed,err=tabu_res$error)
+  ) |>
+    dplyr::mutate(graph_type=graph_type, p=p, n=n, alpha=alpha, seed=seed)
+}
+
+# --- Grid experiment ---
+compare_grid <- function(GraphTypes=c("ER","STAR"),
+                         Ns=c(100, 1000, 10000),
+                         Ps=c(10, 20),
+                         reps=10, alpha=0.05, seed0=20250816,
+                         enable_timeout=TRUE, custom_timeouts=NULL){
+  grid <- expand.grid(graph_type=GraphTypes, n=Ns, p=Ps, stringsAsFactors=FALSE)
+  out <- vector("list", nrow(grid)*reps); k <- 1L
+  cat(sprintf("STAR vs ER: %d combinations × %d reps\n", nrow(grid), reps))
+  for (i in seq_len(nrow(grid))){
+    gi <- grid[i,]; cat(sprintf("\n[%d/%d] type=%s, n=%d, p=%d\n", i, nrow(grid), gi$graph_type, gi$n, gi$p))
+    for (r in seq_len(reps)){
+      cat(sprintf("  Rep %d/%d ... ", r, reps))
+      out[[k]] <- run_once(graph_type=gi$graph_type, p=gi$p, n=gi$n,
+                           alpha=alpha, seed=seed0 + i*1000 + r,
+                           enable_timeout=enable_timeout, custom_timeouts=custom_timeouts)
+      cat("done\n"); k <- k + 1L
+    }
+  }
+  res <- dplyr::bind_rows(out)
+  summary <- res |>
+    dplyr::group_by(graph_type, alg, n, p) |>
+    dplyr::summarise(
+      skel_f1_mean = mean(skel_f1, na.rm=TRUE),
+      skel_f1_sd   = sd(skel_f1,   na.rm=TRUE),
+      shd_mean     = mean(shd_cpdag, na.rm=TRUE),
+      shd_sd       = sd(shd_cpdag,   na.rm=TRUE),
+      time_mean    = mean(time, na.rm=TRUE),
+      time_sd      = sd(time,   na.rm=TRUE),
+      err_count    = sum(!is.na(err)),
+      timeout_count = sum(!is.na(err) & grepl("TIMEOUT", err)),
+      .groups="drop"
+    )
+  list(raw=res, summary=summary)
+}
+
+# --- Params & run ---
+GraphTypes <- c("ER","STAR")
+Ns <- c(100, 1000, 10000)
+Ps <- c(10, 20)
+alpha_val <- 0.05
+reps_val  <- 10
+enable_timeout <- TRUE
+custom_timeouts <- list(PC=600, CPC=720, `PC-stable`=900, GES=480, HC=1200, Tabu=1500)
+
+cat("=== STAR vs ER (Gaussian) ===\n")
+set.seed(1)
+res_ok <- compare_grid(GraphTypes=GraphTypes, Ns=Ns, Ps=Ps,
+                       reps=reps_val, alpha=alpha_val,
+                       enable_timeout=enable_timeout, custom_timeouts=custom_timeouts)
+
+readr::write_csv(res_ok$raw,     file.path(root,"output","raw","raw_results_STAR_vs_ER.csv"))
+readr::write_csv(res_ok$summary, file.path(root,"output","summary","summary_STAR_vs_ER.csv"))
+
+# --- Visualization (facet by graph_type & p) ---
+ggplot2::theme_set(theme_bw(base_size = 12))
+alg_levels <- c("PC","CPC","PC-stable","GES","HC","Tabu")
+alg_labels <- c("PC","CPC","PCS","GES","HC","Tabu")
+cb_palette <- c("#1b9e77","#d95f02","#7570b3","#66a61e","#e7298a","#e6ab02")
+
+legend_bottom <- theme(
+  legend.position = "bottom",
+  legend.box = "horizontal",
+  legend.margin = margin(2,0,2,0),
+  legend.key.height = unit(10, "pt"),
+  legend.key.width  = unit(16, "pt")
+)
+facet_style <- theme(
+  strip.background = element_rect(fill = "grey95", colour = NA),
+  panel.grid.minor = element_blank()
+)
+
+title_center <- theme(
+  plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+  plot.subtitle = element_text(hjust = 0.5, size = 12, colour = "gray40"),
+  plot.title.position = "plot"
+)
+
+summary_df <- res_ok$summary %>%
+  dplyr::mutate(
+    alg        = factor(alg, levels = alg_levels, labels = alg_labels),
+    n          = factor(n, levels = sort(unique(n))),
+    p          = factor(p, levels = sort(unique(p))),
+    graph_type = factor(graph_type, levels = c("ER","STAR"))
+  )
+
+raw_df <- res_ok$raw %>%
+  dplyr::mutate(
+    alg        = factor(alg, levels = alg_levels, labels = alg_labels),
+    n          = factor(n, levels = sort(unique(n))),
+    p          = factor(p, levels = sort(unique(p))),
+    graph_type = factor(graph_type, levels = c("ER","STAR"))
+  )
+
+pr_summary <- raw_df %>%
+  dplyr::group_by(graph_type, alg, n, p) %>%
+  dplyr::summarise(
+    prec_mean = mean(skel_precision, na.rm = TRUE),
+    prec_sd   = sd(skel_precision,   na.rm = TRUE),
+    rec_mean  = mean(skel_recall,    na.rm = TRUE),
+    rec_sd    = sd(skel_recall,      na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    n          = factor(n, levels = sort(unique(as.numeric(as.character(n))))),
+    p          = factor(p, levels = sort(unique(as.numeric(as.character(p))))),
+    graph_type = factor(graph_type, levels = c("ER","STAR"))
+  )
+
+
+p_bar_precision <- ggplot(pr_summary, aes(x = n, y = prec_mean, fill = alg)) +
+  geom_col(position = position_dodge(width = 0.72), width = 0.62) +
+  geom_errorbar(aes(ymin = pmax(prec_mean - prec_sd, 0),
+                    ymax = pmin(prec_mean + prec_sd, 1)),
+                width = 0.20, position = position_dodge(width = 0.72)) +
+  facet_grid(graph_type ~ p, labeller = label_both) +
+  scale_fill_manual(values = cb_palette, name = "Algorithm",
+                    guide = guide_legend(nrow = 1, byrow = TRUE)) +
+  labs(
+    title = "Skeleton Precision Across Sample Size — Star vs ER (Gaussian)",
+    subtitle = "Mean ± SD across replications • Rows: Graph type • Cols: p",
+    x = "Sample Size (n)", y = "Precision"
+  ) +
+  title_center + facet_style + legend_bottom
+ggsave(file.path(root, "figs", "star_er_bar_precision_vs_n.png"),
+       p_bar_precision, width = 12, height = 8, dpi = 300, bg = "white")
+
+
+p_bar_recall <- ggplot(pr_summary, aes(x = n, y = rec_mean, fill = alg)) +
+  geom_col(position = position_dodge(width = 0.72), width = 0.62) +
+  geom_errorbar(aes(ymin = pmax(rec_mean - rec_sd, 0),
+                    ymax = pmin(rec_mean + rec_sd, 1)),
+                width = 0.20, position = position_dodge(width = 0.72)) +
+  facet_grid(graph_type ~ p, labeller = label_both) +
+  scale_fill_manual(values = cb_palette, name = "Algorithm",
+                    guide = guide_legend(nrow = 1, byrow = TRUE)) +
+  labs(
+    title = "Skeleton Recall Across Sample Size — Star vs ER (Gaussian)",
+    subtitle = "Mean ± SD across replications • Rows: Graph type • Cols: p",
+    x = "Sample Size (n)", y = "Recall"
+  ) +
+  title_center + facet_style + legend_bottom
+ggsave(file.path(root, "figs", "star_er_bar_recall_vs_n.png"),
+       p_bar_recall, width = 12, height = 8, dpi = 300, bg = "white")
+
+
+
+p_line_f1 <- ggplot(summary_df,
+                    aes(x = as.numeric(as.character(n)),
+                        y = skel_f1_mean, colour = alg, fill = alg, group = alg)) +
+  geom_ribbon(aes(ymin = pmax(skel_f1_mean - skel_f1_sd, 0),
+                  ymax = pmin(skel_f1_mean + skel_f1_sd, 1)),
+              alpha = 0.12, colour = NA) +
+  geom_line(size = 0.9) + geom_point(size = 1.6) +
+  scale_x_continuous(breaks = as.numeric(levels(summary_df$n)),
+                     labels = levels(summary_df$n)) +
+  facet_grid(graph_type ~ p, labeller = label_both) +
+  scale_colour_manual(values = cb_palette, name = "Algorithm",
+                      guide = guide_legend(nrow = 1, byrow = TRUE)) +
+  scale_fill_manual(values = cb_palette, guide = "none") +
+  labs(
+    title = "Skeleton F1 Across Sample Size — Star vs ER (Gaussian)",
+    subtitle = "Mean ± SD across replications • Rows: Graph type • Cols: p",
+    x = "Sample Size (n)", y = "F1-Score"
+  ) +
+  title_center + facet_style + legend_bottom
+ggsave(file.path(root, "figs", "star_er_line_f1_vs_n.png"),
+       p_line_f1, width = 12, height = 8, dpi = 300, bg = "white")
+
+
+
+p_line_shd <- ggplot(summary_df,
+                     aes(x = as.numeric(as.character(n)),
+                         y = shd_mean, colour = alg, fill = alg, group = alg)) +
+  geom_ribbon(aes(ymin = pmax(shd_mean - shd_sd, 0),
+                  ymax = shd_mean + shd_sd),
+              alpha = 0.12, colour = NA) +
+  geom_line(size = 0.9) + geom_point(size = 1.6) +
+  scale_x_continuous(breaks = as.numeric(levels(summary_df$n)),
+                     labels = levels(summary_df$n)) +
+  facet_grid(graph_type ~ p, labeller = label_both, scales = "free_y") +
+  scale_colour_manual(values = cb_palette, name = "Algorithm",
+                      guide = guide_legend(nrow = 1, byrow = TRUE)) +
+  scale_fill_manual(values = cb_palette, guide = "none") +
+  labs(
+    title = "Structural Hamming Distance Across Sample Size — Star vs ER (Gaussian)",
+    subtitle = "Mean ± SD across replications • Rows: Graph type • Cols: p",
+    x = "Sample Size (n)", y = "SHD"
+  ) +
+  title_center + facet_style + legend_bottom
+ggsave(file.path(root, "figs", "star_er_line_shd_vs_n.png"),
+       p_line_shd, width = 12, height = 8, dpi = 300, bg = "white")
+
+
+p_line_time <- ggplot(summary_df,
+                      aes(x = as.numeric(as.character(n)),
+                          y = time_mean, colour = alg, fill = alg, group = alg)) +
+  geom_ribbon(aes(ymin = pmax(time_mean - time_sd, 1e-6),
+                  ymax = time_mean + time_sd),
+              alpha = 0.12, colour = NA) +
+  geom_line(size = 0.9) + geom_point(size = 1.6) +
+  scale_x_continuous(breaks = as.numeric(levels(summary_df$n)),
+                     labels = levels(summary_df$n)) +
+  scale_y_log10() +
+  facet_grid(graph_type ~ p, labeller = label_both) +
+  scale_colour_manual(values = cb_palette, name = "Algorithm",
+                      guide = guide_legend(nrow = 1, byrow = TRUE)) +
+  scale_fill_manual(values = cb_palette, guide = "none") +
+  labs(
+    title = "Runtime Across Sample Size — Star vs ER (Gaussian)",
+    subtitle = "Mean ± SD across replications • Rows: Graph type • Cols: p",
+    x = "Sample Size (n)", y = "Runtime (seconds, log scale)"
+  ) +
+  title_center + facet_style + legend_bottom
+ggsave(file.path(root, "figs", "star_er_line_time_vs_n_log.png"),
+       p_line_time, width = 12, height = 8, dpi = 300, bg = "white")
+
+
+
+# --- Session info ---
+sink(file.path(root, "logs", "sessionInfo_STAR_vs_ER.txt"))
+print(Sys.time()); print(sessionInfo())
+sink()
+
+message("Done. Output at: ", normalizePath(root, winslash = "/"))
